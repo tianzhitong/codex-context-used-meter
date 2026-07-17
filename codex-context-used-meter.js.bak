@@ -9,7 +9,7 @@
   const UI_STATE_STORAGE_KEY = "__codexContextMeterUiState";
   const PROVIDER_SUMMARY_KEY = "__codexContextMeterProviderSummary";
   const PROVIDER_SUMMARY_EVENT = "codex-context-meter-provider-summary";
-  const SCRIPT_VERSION = 103;
+  const SCRIPT_VERSION = 102;
   const UPDATE_INTERVAL_MS = 5000;
   const SLOW_SCAN_INTERVAL_MS = UPDATE_INTERVAL_MS;
   const CONTEXT_USAGE_BACKGROUND_SAMPLE_INTERVAL_MS = UPDATE_INTERVAL_MS;
@@ -278,12 +278,6 @@
     postMessageUsageAt: 0,
     postMessageListenerInstalled: false,
     postMessageUsageListener: null,
-    // v103: 自包含 WebSocket/fetch 拦截，不依赖 token-usage 脚本。
-    capturedUsage: null,
-    capturedUsageConversationId: null,
-    capturedUsageAt: 0,
-    webSocketIntercepted: false,
-    fetchIntercepted: false,
     threadContentLookupAt: 0,
     threadContentLookupResult: false,
   };
@@ -1144,8 +1138,7 @@
       return null;
     };
     const findComposerFooterMount = () => {
-      const footerSelector = ".composer-footer, [class*='_footer_'], .composer-surface-chrome [class*='footer']";
-      const footers = Array.from(document.querySelectorAll(footerSelector))
+      const footers = Array.from(document.querySelectorAll(".composer-footer"))
         .filter((footer) => isVisibleElement(footer) && footer.getBoundingClientRect().top > window.innerHeight * 0.45)
         .sort((left, right) => right.getBoundingClientRect().top - left.getBoundingClientRect().top);
 
@@ -1179,7 +1172,7 @@
       return null;
     };
     const findStructuralMountForControl = (control) => {
-      const footer = control.closest(".composer-footer, [class*='_footer_'], [class*='footer']");
+      const footer = control.closest(".composer-footer");
       if (footer) {
         const footerRect = footer.getBoundingClientRect();
         const controlRect = control.getBoundingClientRect();
@@ -1189,7 +1182,6 @@
       let current = control.parentElement;
       while (current && current !== document.body) {
         const rect = current.getBoundingClientRect();
-        if (rect.height === 0 || rect.width === 0) { current = current.parentElement; continue; }
         if (rect.top < window.innerHeight * 0.45) break;
         if (current.closest(CONVERSATION_CONTENT_SELECTOR)) break;
         if (!current.closest(INVALID_INLINE_MOUNT_SELECTOR)) {
@@ -1256,8 +1248,8 @@
       state.inlineMountCache = null;
       state.inlineMountPending = true;
       if (root.parentNode !== document.body) document.body.appendChild(root);
-      // inline 挂载点未就绪时回退到 floating 显示，避免 meter 永久隐藏。
-      root.dataset.placement = "floating";
+      root.dataset.placement = "inline";
+      root.hidden = true;
       applyFloatingUiState(root);
       closeSpendHistory();
       scheduleUpdate(SWITCH_RETRY_INTERVAL_MS);
@@ -2306,6 +2298,12 @@
   function updateDockVisibility(root) {
     const contextVisible = state.contextCard && !state.contextCard.hidden;
     const providerVisible = state.providerCard && !state.providerCard.hidden;
+    if (state.inlineMountPending && (state.uiState || readUiState()).mode !== "floating") {
+      root.hidden = true;
+      closeSpendHistory();
+      return;
+    }
+
     const hidden = !contextVisible && !providerVisible;
     const keepVisibleForSpend = hidden && hasPendingSpendEffects();
     root.hidden = hidden && !keepVisibleForSpend;
@@ -3465,43 +3463,22 @@
     const tu = window.__codexTokenUsage;
     if (!tu || !tu.last || !tu.last.usage) return null;
 
-    // Skip self-originated readings: token-usage script's readContextMeterMetric()
-    // writes our lastReading back into tu.last with source "token-usage-script",
-    // creating a feedback loop that overwrites real turn data.
-    const source = tu.last.source;
-    const isSelfOriginated = source === "token-usage-script" || source === "context-meter";
-
-    // Find the best usage entry: prefer real (non-self) entries over self-originated ones.
-    let entry = tu.last;
-    if (isSelfOriginated) {
-      const real = (tu.recent || []).find(
-        (e) => e && e.usage && e.source !== "token-usage-script" && e.source !== "context-meter",
-      );
-      if (!real) return null;
-      entry = real;
-    }
-
-    const usage = entry.usage;
+    const usage = tu.last.usage;
     const used = Number.isFinite(usage.contextUsed) ? usage.contextUsed : usage.totalTokens;
     const limit = Number.isFinite(usage.contextLimit) ? usage.contextLimit : null;
     if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return null;
 
     const percent = (used / limit) * 100;
-    const conversationId = entry.conversationId || tu.last.conversationId || null;
-    const reading = makeReading(percent, "token-usage-script", isSelfOriginated ? "__codexTokenUsage.recent" : "__codexTokenUsage.last", used, limit);
+    const conversationId = tu.last.conversationId || null;
+    const reading = makeReading(percent, "token-usage-script", "__codexTokenUsage.last", used, limit);
     return withConversationId(reading, conversationId || activeConversationId);
   }
 
-  // v103: 自包含用量捕获 —— 直接 wrap WebSocket 和 fetch，从网络流量里提取
-  // contextUsed / contextLimit，不再依赖外部 token-usage 脚本。
-  function normalizeNumber(value) {
-    const n = Number(value);
-    return Number.isFinite(n) && n >= 0 ? Math.round(n) : 0;
-  }
-
+  // v102: 独立 postMessage 监听，在 token-usage 脚本不存在时兜底捕获用量。
+  // Codex App 通过 window.postMessage 向自身推送 usage 事件，里面带 contextUsed / contextLimit。
   function normalizeUsageRaw(raw) {
     if (!raw || typeof raw !== "object") return null;
-    const used = normalizeNumber(raw.contextUsed ?? raw.context_used ?? raw.usedTokens ?? raw.used_tokens ?? raw.used);
+    const used = Number(raw.contextUsed ?? raw.context_used ?? raw.usedTokens ?? raw.used_tokens ?? raw.used);
     const limit = Number(
       raw.contextLimit ?? raw.context_limit ?? raw.modelContextWindow ?? raw.model_context_window ?? raw.contextWindow ?? raw.context_window ?? raw.limit,
     );
@@ -3509,128 +3486,25 @@
     return { used, limit, conversationId: raw.conversationId || raw.conversation_id || null };
   }
 
-  // 从任意嵌套对象里收集所有 usage 条目（支持 SSE 流式 fragment）。
-  function collectUsageFromObject(value, depth, found, seen) {
-    if (!value || depth > 8 || found.length > 8) return;
+  function collectUsageFromObject(value, depth, found) {
+    if (!value || depth > 8 || found.length > 0) return;
     if (Array.isArray(value)) {
-      for (const item of value) collectUsageFromObject(item, depth + 1, found, seen);
+      for (const item of value) collectUsageFromObject(item, depth + 1, found);
       return;
     }
     if (typeof value !== "object") return;
-    if (seen && seen.has(value)) return;
-    seen && seen.add(value);
 
     const direct = normalizeUsageRaw(value);
     if (direct) { found.push(direct); return; }
-    for (const key of ["usage", "last", "lastUsage", "lastTokenUsage", "last_token_usage"]) {
+    for (const key of ["usage", "last", "lastUsage", "lastTokenUsage"]) {
       const nested = normalizeUsageRaw(value[key]);
       if (nested) { found.push(nested); return; }
     }
     for (const key of Object.keys(value).slice(0, 60)) {
-      try { collectUsageFromObject(value[key], depth + 1, found, seen); } catch {}
+      try { collectUsageFromObject(value[key], depth + 1, found); } catch {}
     }
   }
 
-  function extractJsonFragmentsFromSse(text) {
-    return String(text || "")
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trim())
-      .filter((line) => line && line !== "[DONE]");
-  }
-
-  // 从 JSON 字符串、SSE 流文本、或已解析对象里提取所有 usage 条目。
-  function extractUsagesFromPayload(payload) {
-    const found = [];
-    if (typeof payload === "string") {
-      try {
-        collectUsageFromObject(JSON.parse(payload), 0, found, new WeakSet());
-        if (found.length) return found;
-      } catch {}
-      for (const fragment of extractJsonFragmentsFromSse(payload)) {
-        try { collectUsageFromObject(JSON.parse(fragment), 0, found, new WeakSet()); } catch {}
-      }
-    } else if (payload && typeof payload === "object") {
-      collectUsageFromObject(payload, 0, found, new WeakSet());
-    }
-    return found;
-  }
-
-  function rememberCapturedUsage(usages) {
-    if (!usages || !usages.length) return;
-    const latest = usages[usages.length - 1];
-    state.capturedUsage = latest;
-    state.capturedUsageConversationId = latest.conversationId;
-    state.capturedUsageAt = Date.now();
-    scheduleUpdate(MUTATION_UPDATE_DELAY_MS);
-  }
-
-  function isCodexApiUrl(url) {
-    const text = String(url || "");
-    return /\/(responses|chat\/completions|conversation|thread|api)\b/i.test(text) || /codex/i.test(text);
-  }
-
-  // v103: wrap window.WebSocket，拦截 socket message 提取 usage。
-  function installWebSocketInterceptor() {
-    if (state.webSocketIntercepted) return;
-    if (typeof window.WebSocket !== "function") return;
-    const NativeWebSocket = window.WebSocket;
-
-    const wrapper = function InterceptedWebSocket(...args) {
-      const socket = new NativeWebSocket(...args);
-      socket.addEventListener?.("message", (event) => {
-        try {
-          if (typeof event.data === "string") {
-            const usages = extractUsagesFromPayload(event.data);
-            if (usages.length) rememberCapturedUsage(usages);
-          } else if (event.data instanceof Blob && event.data.size <= 512000) {
-            event.data.text().then((text) => {
-              const usages = extractUsagesFromPayload(text);
-              if (usages.length) rememberCapturedUsage(usages);
-            }).catch(() => {});
-          }
-        } catch {}
-      });
-      return socket;
-    };
-
-    try {
-      wrapper.prototype = NativeWebSocket.prototype;
-      Object.defineProperty(wrapper, "CONNECTING", { value: NativeWebSocket.CONNECTING });
-      Object.defineProperty(wrapper, "OPEN", { value: NativeWebSocket.OPEN });
-      Object.defineProperty(wrapper, "CLOSING", { value: NativeWebSocket.CLOSING });
-      Object.defineProperty(wrapper, "CLOSED", { value: NativeWebSocket.CLOSED });
-    } catch {}
-
-    window.WebSocket = wrapper;
-    state.webSocketIntercepted = true;
-  }
-
-  // v103: wrap window.fetch，拦截 Codex API 响应提取 usage。
-  function installFetchInterceptor() {
-    if (state.fetchIntercepted) return;
-    if (typeof window.fetch !== "function") return;
-    const nativeFetch = window.fetch;
-
-    function wrappedFetch(input, init) {
-      const url = typeof input === "string" ? input : input?.url || String(input || "");
-      return nativeFetch.call(window, input, init).then((response) => {
-        if (isCodexApiUrl(url) && response?.clone) {
-          response.clone().text().then((text) => {
-            const usages = extractUsagesFromPayload(text);
-            if (usages.length) rememberCapturedUsage(usages);
-          }).catch(() => {});
-        }
-        return response;
-      });
-    }
-
-    window.fetch = wrappedFetch;
-    state.fetchIntercepted = true;
-  }
-
-  // v102: postMessage 监听保留为补充来源（某些 Codex 版本通过 postMessage 推送 usage）。
   function installPostMessageUsageCapture() {
     if (state.postMessageListenerInstalled) return;
     state.postMessageListenerInstalled = true;
@@ -3645,54 +3519,48 @@
           if (typeof data === "string") {
             try { payload = JSON.parse(data); } catch { return; }
           }
-          const found = extractUsagesFromPayload(payload);
-          if (found.length) rememberCapturedUsage(found);
+          const found = [];
+          collectUsageFromObject(payload, 0, found);
+          if (!found.length) return;
+          const latest = found[found.length - 1];
+          state.postMessageUsage = latest;
+          state.postMessageUsageConversationId = latest.conversationId;
+          state.postMessageUsageAt = Date.now();
+          scheduleUpdate(MUTATION_UPDATE_DELAY_MS);
         } catch {}
       }),
       true,
     );
   }
 
-  function installNetworkInterceptors() {
-    installWebSocketInterceptor();
-    installFetchInterceptor();
-    installPostMessageUsageCapture();
-  }
-
-  // v103: 读取网络拦截捕获的 usage（WebSocket / fetch / postMessage 共享同一缓存）。
-  function scanCapturedContextUsage(activeConversationId) {
-    if (!state.capturedUsage) return null;
-    if (Date.now() - state.capturedUsageAt > 10 * 60 * 1000) return null;
-
-    const { used, limit, conversationId } = state.capturedUsage;
-    const percent = (used / limit) * 100;
-    const reading = makeReading(percent, "network-capture", "websocket/fetch", used, limit);
-    return withConversationId(reading, conversationId || activeConversationId);
-  }
-
-  // 保留旧函数名兼容（postMessage 数据现在统一走 capturedUsage）。
   function scanPostMessageContextUsage(activeConversationId) {
-    return scanCapturedContextUsage(activeConversationId);
+    if (!state.postMessageUsage) return null;
+    // 10 分钟外的捕获视为过期。
+    if (Date.now() - state.postMessageUsageAt > 10 * 60 * 1000) return null;
+
+    const { used, limit, conversationId } = state.postMessageUsage;
+    const percent = (used / limit) * 100;
+    const reading = makeReading(percent, "post-message", "window.message", used, limit);
+    return withConversationId(reading, conversationId || activeConversationId);
   }
 
   function detectReading() {
     state.scanGeneration += 1;
     const activeConversationId = updateActiveConversationId();
 
-    // v103: 优先使用自包含网络拦截（WebSocket/fetch）捕获的读数。
-    const capturedReading = scanCapturedContextUsage(activeConversationId);
-    if (capturedReading) {
-      state.switchRetryUntil = 0;
-      clearRetryUpdate();
-      return capturedReading;
-    }
-
-    // v102: 如果 token-usage 脚本存在则复用其数据（可选增强源）。
+    // v102: 优先从 token-usage 脚本和 postMessage 捕获读数，不依赖已失效的 app-signal chunk。
     const tokenUsageReading = scanTokenUsageScriptContextUsage(activeConversationId);
     if (tokenUsageReading) {
       state.switchRetryUntil = 0;
       clearRetryUpdate();
       return tokenUsageReading;
+    }
+
+    const postMessageReading = scanPostMessageContextUsage(activeConversationId);
+    if (postMessageReading) {
+      state.switchRetryUntil = 0;
+      clearRetryUpdate();
+      return postMessageReading;
     }
 
     if (!activeConversationId) {
@@ -4015,8 +3883,6 @@
         window.removeEventListener("message", state.postMessageUsageListener, true);
         state.postMessageUsageListener = null;
       }
-      state.capturedUsage = null;
-      state.capturedUsageAt = 0;
 
       const root = document.getElementById(ROOT_ID);
       if (root) root.remove();
@@ -4048,7 +3914,7 @@
 
   restoreLegacyCaptureHooks();
   installStyle();
-  installNetworkInterceptors();
+  installPostMessageUsageCapture();
   installProviderSummaryListener();
   updateMeter();
   installObserver();
