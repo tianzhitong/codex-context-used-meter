@@ -9,7 +9,7 @@
   const UI_STATE_STORAGE_KEY = "__codexContextMeterUiState";
   const PROVIDER_SUMMARY_KEY = "__codexContextMeterProviderSummary";
   const PROVIDER_SUMMARY_EVENT = "codex-context-meter-provider-summary";
-  const SCRIPT_VERSION = 110;
+  const SCRIPT_VERSION = 112;
   const UPDATE_INTERVAL_MS = 5000;
   const SLOW_SCAN_INTERVAL_MS = UPDATE_INTERVAL_MS;
   const CONTEXT_USAGE_BACKGROUND_SAMPLE_INTERVAL_MS = UPDATE_INTERVAL_MS;
@@ -298,18 +298,14 @@
     scanGeneration: 0,
     filteredReflectKeyCache: new WeakMap(),
     appSignalSkipGeneration: new WeakMap(),
-    // v102: 独立 postMessage 用量捕获（不依赖 token-usage 脚本时的兜底）。
-    postMessageUsage: null,
-    postMessageUsageConversationId: null,
-    postMessageUsageAt: 0,
-    postMessageListenerInstalled: false,
-    postMessageUsageListener: null,
-    // v103: 自包含 WebSocket/fetch 拦截，不依赖 token-usage 脚本。
+    // v112: 合并 token-usage 脚本的网络捕获和提取层。四个拦截器统一输出到 capturedUsage。
     capturedUsage: null,
     capturedUsageConversationId: null,
     capturedUsageAt: 0,
     webSocketIntercepted: false,
     fetchIntercepted: false,
+    xhrIntercepted: false,
+    postMessageObserverInstalled: false,
     // v104: 网络拦截看到的最后一个模型名，用于查上下文窗口。
     lastSeenModel: null,
     threadContentLookupAt: 0,
@@ -3664,44 +3660,6 @@
     return null;
   }
 
-  // 读取顺序按稳定性排列：app signal > 结构化 React 状态 > window 缓存。
-  // v102: 从同页的 codex-token-usage 脚本读取已捕获的上下文用量。
-  // token-usage 脚本通过 postMessage / WebSocket 拦截拿到了 contextUsed / contextLimit，
-  // 这正是本组件需要的信号；直接复用避免重复拦截。
-  function scanTokenUsageScriptContextUsage(activeConversationId) {
-    const tu = window.__codexTokenUsage;
-    if (!tu || !tu.last || !tu.last.usage) return null;
-
-    // Skip self-originated readings: token-usage script's readContextMeterMetric()
-    // writes our lastReading back into tu.last with source "token-usage-script",
-    // creating a feedback loop that overwrites real turn data.
-    const source = tu.last.source;
-    const isSelfOriginated = source === "token-usage-script" || source === "context-meter";
-
-    // Find the best usage entry: prefer real (non-self) entries over self-originated ones.
-    let entry = tu.last;
-    if (isSelfOriginated) {
-      const real = (tu.recent || []).find(
-        (e) => e && e.usage && e.source !== "token-usage-script" && e.source !== "context-meter",
-      );
-      if (!real) return null;
-      entry = real;
-    }
-
-    const usage = entry.usage;
-    const used = Number.isFinite(usage.contextUsed) ? usage.contextUsed : usage.totalTokens;
-    // v104: API 响应不带 contextLimit 时，用已捕获的模型名查上下文窗口。
-    let limit = Number.isFinite(usage.contextLimit) ? usage.contextLimit : 0;
-    if (!limit || limit <= 0) {
-      limit = lookupModelContextWindow(state.lastSeenModel);
-    }
-    if (!Number.isFinite(used) || used <= 0 || !Number.isFinite(limit) || limit <= 0) return null;
-
-    const percent = (used / limit) * 100;
-    const conversationId = entry.conversationId || tu.last.conversationId || null;
-    const reading = makeReading(percent, "token-usage-script", isSelfOriginated ? "__codexTokenUsage.recent" : "__codexTokenUsage.last", used, limit);
-    return withConversationId(reading, conversationId || activeConversationId);
-  }
 
   // v103: 自包含用量捕获 —— 直接 wrap WebSocket 和 fetch，从网络流量里提取
   // contextUsed / contextLimit，不再依赖外部 token-usage 脚本。
@@ -3721,82 +3679,161 @@
     return DEFAULT_CONTEXT_WINDOW;
   }
 
-  // v104: 从 OpenAI API 响应对象里提取 usage —— 同时找 model 和 usage，
-  // 用 model 查上下文窗口作为 limit。API 响应里 usage 和 model 在同一个
-  // response 对象上，但 collectUsageFromObject 拆到 usage 叶子时丢了 model。
-  function extractApiUsageFromObject(obj) {
-    if (!obj || typeof obj !== "object") return null;
-    let model = null;
-    let usage = null;
-
-    function scan(value, depth) {
-      if (!value || typeof value !== "object" || depth > 6) return;
-      if (!model && typeof value.model === "string") model = value.model;
-      if (!usage && value.usage && typeof value.usage === "object") {
-        const inputTokens = Number(value.usage.input_tokens ?? value.usage.inputTokens);
-        if (Number.isFinite(inputTokens) && inputTokens > 0) usage = value.usage;
-      }
-      if (model && usage) return;
-      if (Array.isArray(value)) {
-        for (const item of value) { scan(item, depth + 1); if (model && usage) return; }
-        return;
-      }
-      for (const key of Object.keys(value).slice(0, 50)) {
-        try { scan(value[key], depth + 1); if (model && usage) return; } catch {}
-      }
-    }
-
-    scan(obj, 0);
-    if (!usage) return null;
-
-    const used = Number(
-      usage.input_tokens ?? usage.inputTokens ?? usage.total_tokens ?? usage.totalTokens,
+  // v112: 从 token-usage 脚本移植的 13 字段归一化提取层。
+  // 覆盖 OpenAI / Anthropic / 旧版别名，递归遍历对象树（深度 8，WeakSet 防环）。
+  function normalizeUsage(value) {
+    if (!value || typeof value !== "object") return null;
+    const inputTokens = normalizeNumber(value.input_tokens ?? value.inputTokens ?? value.prompt_tokens ?? value.promptTokens);
+    const outputTokens = normalizeNumber(
+      value.output_tokens ?? value.outputTokens ?? value.completion_tokens ?? value.completionTokens,
     );
-    if (!Number.isFinite(used) || used <= 0) return null;
-
-    const limit = lookupModelContextWindow(model);
-    if (model) state.lastSeenModel = model;
-    return { used, limit, conversationId: null };
+    const explicitTotal = value.total_tokens ?? value.totalTokens ?? value.usedTokens ?? value.used_tokens ?? value.used;
+    const totalEstimated = explicitTotal == null && !!(inputTokens || outputTokens);
+    const totalTokens = normalizeNumber(explicitTotal ?? inputTokens + outputTokens);
+    const cachedTokens = normalizeNumber(
+      value.cached_tokens ??
+        value.cachedTokens ??
+        value.cached_input_tokens ??
+        value.cachedInputTokens ??
+        value.prompt_tokens_details?.cached_tokens ??
+        value.promptTokensDetails?.cachedTokens ??
+        value.input_tokens_details?.cached_tokens ??
+        value.inputTokensDetails?.cachedTokens,
+    );
+    const cacheReadTokens = normalizeNumber(value.cache_read_input_tokens ?? value.cacheReadInputTokens);
+    const cacheCreationTokens = normalizeNumber(value.cache_creation_input_tokens ?? value.cacheCreationInputTokens);
+    const cachedReadTokens = cacheReadTokens || cachedTokens;
+    const explicitInputTotal = normalizeNumber(
+      value.input_total_tokens ?? value.inputTotalTokens ?? value.prompt_total_tokens ?? value.promptTotalTokens,
+    );
+    const contextUsed = normalizeNumber(value.contextUsed ?? value.context_used ?? value.usedTokens ?? value.used_tokens ?? value.used);
+    const contextLimit = normalizeNumber(
+      value.contextLimit ?? value.context_limit ?? value.modelContextWindow ?? value.model_context_window ?? value.contextWindow ?? value.context_window ?? value.limit,
+    );
+    if (
+      !inputTokens &&
+      !outputTokens &&
+      !totalTokens &&
+      !cachedTokens &&
+      !cacheReadTokens &&
+      !cacheCreationTokens &&
+      !contextLimit
+    ) {
+      return null;
+    }
+    const inputFromTotal = totalTokens && outputTokens && totalTokens > outputTokens ? totalTokens - outputTokens : 0;
+    let inputTotalTokens = Math.max(explicitInputTotal, inputTokens, inputFromTotal);
+    if (cachedReadTokens > inputTotalTokens) {
+      inputTotalTokens += cachedReadTokens + cacheCreationTokens;
+    }
+    return {
+      inputTokens,
+      inputTotalTokens,
+      outputTokens,
+      outputTotalTokens: outputTokens,
+      totalTokens,
+      requestTotalTokens: totalTokens,
+      cachedTokens,
+      cachedReadTokens,
+      cacheReadTokens,
+      cacheCreationTokens,
+      totalEstimated,
+      hasBreakdown: !!(inputTokens || outputTokens || cachedTokens || cacheReadTokens || cacheCreationTokens),
+      contextUsed: contextUsed || totalTokens,
+      contextLimit,
+    };
   }
 
-  function normalizeUsageRaw(raw) {
-    if (!raw || typeof raw !== "object") return null;
-    const used = normalizeNumber(
-      raw.contextUsed ?? raw.context_used ?? raw.usedTokens ?? raw.used_tokens ?? raw.used
-      ?? raw.input_tokens ?? raw.inputTokens ?? raw.total_tokens ?? raw.totalTokens,
-    );
-    let limit = Number(
-      raw.contextLimit ?? raw.context_limit ?? raw.modelContextWindow ?? raw.model_context_window ?? raw.contextWindow ?? raw.context_window ?? raw.limit,
-    );
-    // v104: 如果没有显式 limit，尝试从同对象的 model 字段查上下文窗口。
-    if (!Number.isFinite(limit) || limit <= 0) {
-      const model = raw.model || raw.modelName || raw.model_name;
-      if (model) limit = lookupModelContextWindow(model);
-    }
-    if (!Number.isFinite(used) || used <= 0 || !Number.isFinite(limit) || limit <= 0) return null;
-    return { used, limit, conversationId: raw.conversationId || raw.conversation_id || null };
-  }
-
-  // 从任意嵌套对象里收集所有 usage 条目（支持 SSE 流式 fragment）。
-  function collectUsageFromObject(value, depth, found, seen) {
-    if (!value || depth > 8 || found.length > 8) return;
+  function findUsageInObject(value, depth, modelRef) {
+    if (!value || depth > 8) return null;
     if (Array.isArray(value)) {
-      for (const item of value) collectUsageFromObject(item, depth + 1, found, seen);
-      return;
+      for (const item of value) {
+        const usage = findUsageInObject(item, depth + 1, modelRef);
+        if (usage) return usage;
+      }
+      return null;
     }
-    if (typeof value !== "object") return;
-    if (seen && seen.has(value)) return;
-    seen && seen.add(value);
+    if (typeof value !== "object") return null;
 
-    const direct = normalizeUsageRaw(value);
-    if (direct) { found.push(direct); return; }
+    if (!modelRef.model && typeof value.model === "string") modelRef.model = value.model;
+
+    const tokenStatus = value.last || value.lastUsage || value.lastTokenUsage || value.last_token_usage;
+    if (tokenStatus && (value.modelContextWindow || value.model_context_window || value.contextWindow || value.context_window)) {
+      const statusUsage = normalizeUsage({
+        ...tokenStatus,
+        modelContextWindow: value.modelContextWindow ?? value.model_context_window,
+        contextWindow: value.contextWindow ?? value.context_window,
+      });
+      if (statusUsage) return statusUsage;
+    }
+
     for (const key of ["usage", "last", "lastUsage", "lastTokenUsage", "last_token_usage"]) {
-      const nested = normalizeUsageRaw(value[key]);
-      if (nested) { found.push(nested); return; }
+      const direct = normalizeUsage(value[key]);
+      if (direct) return direct;
     }
-    for (const key of Object.keys(value).slice(0, 60)) {
-      try { collectUsageFromObject(value[key], depth + 1, found, seen); } catch {}
+
+    const self = normalizeUsage(value);
+    if (self) return self;
+
+    for (const key of [
+      "response", "data", "body", "message", "result", "event", "params",
+      "tokenUsage", "token_usage", "contextUsage", "context_usage", "info",
+    ]) {
+      const usage = findUsageInObject(value[key], depth + 1, modelRef);
+      if (usage) return usage;
     }
+    return null;
+  }
+
+  function collectUsagesInObject(value, depth, usages, seen, modelRef) {
+    if (!value || depth > 8) return usages;
+    if (Array.isArray(value)) {
+      value.forEach((item) => collectUsagesInObject(item, depth + 1, usages, seen, modelRef));
+      return usages;
+    }
+    if (typeof value !== "object") return usages;
+    if (seen.has(value)) return usages;
+    seen.add(value);
+
+    if (!modelRef.model && typeof value.model === "string") modelRef.model = value.model;
+
+    const tokenStatus = value.last || value.lastUsage || value.lastTokenUsage || value.last_token_usage;
+    if (tokenStatus && (value.modelContextWindow || value.model_context_window || value.contextWindow || value.context_window)) {
+      const statusUsage = normalizeUsage({
+        ...tokenStatus,
+        modelContextWindow: value.modelContextWindow ?? value.model_context_window,
+        contextWindow: value.contextWindow ?? value.context_window,
+      });
+      if (statusUsage) {
+        usages.push(statusUsage);
+        return usages;
+      }
+    }
+
+    const directKeys = ["usage", "last", "lastUsage", "lastTokenUsage", "last_token_usage"];
+    const consumedKeys = new Set();
+    for (const key of directKeys) {
+      const direct = normalizeUsage(value[key]);
+      if (direct) {
+        usages.push(direct);
+        consumedKeys.add(key);
+      }
+    }
+
+    const self = normalizeUsage(value);
+    if (self) {
+      usages.push(self);
+      return usages;
+    }
+
+    for (const key of [
+      "response", "data", "body", "message", "result", "event", "params",
+      "tokenUsage", "token_usage", "contextUsage", "context_usage", "info",
+    ]) {
+      if (consumedKeys.has(key)) continue;
+      collectUsagesInObject(value[key], depth + 1, usages, seen, modelRef);
+    }
+    return usages;
   }
 
   function extractJsonFragmentsFromSse(text) {
@@ -3808,44 +3845,61 @@
       .filter((line) => line && line !== "[DONE]");
   }
 
-  // 从 JSON 字符串、SSE 流文本、或已解析对象里提取所有 usage 条目。
-  function extractUsagesFromPayload(payload) {
-    const found = [];
+  function extractUsages(payload) {
+    const modelRef = { model: null };
     if (typeof payload === "string") {
       try {
         const parsed = JSON.parse(payload);
-        collectUsageFromObject(parsed, 0, found, new WeakSet());
-        if (!found.length) {
-          const apiUsage = extractApiUsageFromObject(parsed);
-          if (apiUsage) found.push(apiUsage);
+        const usages = [];
+        collectUsagesInObject(parsed, 0, usages, new WeakSet(), modelRef);
+        if (usages.length) {
+          if (modelRef.model) state.lastSeenModel = modelRef.model;
+          return usages;
         }
-        if (found.length) return found;
-      } catch {}
+      } catch (_) {
+        // Treat non-JSON text as a possible SSE stream below.
+      }
+      const usages = [];
       for (const fragment of extractJsonFragmentsFromSse(payload)) {
         try {
-          const parsed = JSON.parse(fragment);
-          collectUsageFromObject(parsed, 0, found, new WeakSet());
-          if (!found.length) {
-            const apiUsage = extractApiUsageFromObject(parsed);
-            if (apiUsage) found.push(apiUsage);
-          }
-        } catch {}
+          collectUsagesInObject(JSON.parse(fragment), 0, usages, new WeakSet(), modelRef);
+        } catch (_) {
+          // Ignore malformed stream fragments.
+        }
       }
-    } else if (payload && typeof payload === "object") {
-      collectUsageFromObject(payload, 0, found, new WeakSet());
-      if (!found.length) {
-        const apiUsage = extractApiUsageFromObject(payload);
-        if (apiUsage) found.push(apiUsage);
-      }
+      if (modelRef.model) state.lastSeenModel = modelRef.model;
+      return usages;
     }
-    return found;
+    if (payload && typeof payload === "object") {
+      const usages = [];
+      collectUsagesInObject(payload, 0, usages, new WeakSet(), modelRef);
+      if (modelRef.model) state.lastSeenModel = modelRef.model;
+      return usages;
+    }
+    return [];
   }
 
+  // v112: 从归一化 usage 对象提取 used/limit，供 scanCapturedContextUsage 使用。
   function rememberCapturedUsage(usages) {
     if (!usages || !usages.length) return;
     const latest = usages[usages.length - 1];
-    state.capturedUsage = latest;
-    state.capturedUsageConversationId = latest.conversationId;
+    // input_tokens 是上下文窗口消耗的正确度量：total_tokens 包含输出，不代表上下文占用。
+    const used = Number.isFinite(latest.inputTokens) && latest.inputTokens > 0
+      ? latest.inputTokens
+      : Number.isFinite(latest.inputTotalTokens) && latest.inputTotalTokens > 0
+        ? latest.inputTotalTokens
+        : Number.isFinite(latest.contextUsed) && latest.contextUsed > 0
+          ? latest.contextUsed
+          : Number.isFinite(latest.totalTokens) && latest.totalTokens > 0
+            ? latest.totalTokens
+            : 0;
+    let limit = Number.isFinite(latest.contextLimit) && latest.contextLimit > 0
+      ? latest.contextLimit
+      : 0;
+    if (!limit && state.lastSeenModel) limit = lookupModelContextWindow(state.lastSeenModel);
+    if (!used || !limit) return;
+    state.capturedUsage = { used, limit, conversationId: null };
+    state.capturedUsageConversationId = normalizeConversationId(state.activeConversationId) || null;
     state.capturedUsageAt = Date.now();
     scheduleUpdate(MUTATION_UPDATE_DELAY_MS);
   }
@@ -3855,92 +3909,117 @@
     return /\/(responses|chat\/completions|conversation|thread|api)\b/i.test(text) || /codex/i.test(text);
   }
 
-  // v103: wrap window.WebSocket，拦截 socket message 提取 usage。
-  function installWebSocketInterceptor() {
-    if (state.webSocketIntercepted) return;
-    if (typeof window.WebSocket !== "function") return;
-    const NativeWebSocket = window.WebSocket;
-
-    const wrapper = function InterceptedWebSocket(...args) {
-      const socket = new NativeWebSocket(...args);
-      socket.addEventListener?.("message", (event) => {
-        try {
-          if (typeof event.data === "string") {
-            const usages = extractUsagesFromPayload(event.data);
-            if (usages.length) rememberCapturedUsage(usages);
-          } else if (event.data instanceof Blob && event.data.size <= 512000) {
-            event.data.text().then((text) => {
-              const usages = extractUsagesFromPayload(text);
-              if (usages.length) rememberCapturedUsage(usages);
-            }).catch(() => {});
-          }
-        } catch {}
-      });
-      return socket;
-    };
-
-    try {
-      wrapper.prototype = NativeWebSocket.prototype;
-      Object.defineProperty(wrapper, "CONNECTING", { value: NativeWebSocket.CONNECTING });
-      Object.defineProperty(wrapper, "OPEN", { value: NativeWebSocket.OPEN });
-      Object.defineProperty(wrapper, "CLOSING", { value: NativeWebSocket.CLOSING });
-      Object.defineProperty(wrapper, "CLOSED", { value: NativeWebSocket.CLOSED });
-    } catch {}
-
-    window.WebSocket = wrapper;
-    state.webSocketIntercepted = true;
+  function requestUrl(input) {
+    if (typeof input === "string") return input;
+    if (input?.url) return input.url;
+    return String(input || "");
   }
 
-  // v103: wrap window.fetch，拦截 Codex API 响应提取 usage。
-  function installFetchInterceptor() {
-    if (state.fetchIntercepted) return;
-    if (typeof window.fetch !== "function") return;
+  // v112: 从 token-usage 脚本移植的四个拦截器（fetch/XHR/WebSocket/postMessage）。
+  function installFetchObserver() {
+    if (typeof window.fetch !== "function" || state.fetchIntercepted) return;
     const nativeFetch = window.fetch;
-
     function wrappedFetch(input, init) {
-      const url = typeof input === "string" ? input : input?.url || String(input || "");
+      const url = requestUrl(input);
       return nativeFetch.call(window, input, init).then((response) => {
         if (isCodexApiUrl(url) && response?.clone) {
           response.clone().text().then((text) => {
-            const usages = extractUsagesFromPayload(text);
+            const usages = extractUsages(text);
             if (usages.length) rememberCapturedUsage(usages);
           }).catch(() => {});
         }
         return response;
       });
     }
-
     window.fetch = wrappedFetch;
     state.fetchIntercepted = true;
   }
 
-  // v102: postMessage 监听保留为补充来源（某些 Codex 版本通过 postMessage 推送 usage）。
-  function installPostMessageUsageCapture() {
-    if (state.postMessageListenerInstalled) return;
-    state.postMessageListenerInstalled = true;
-
-    window.addEventListener(
-      "message",
-      (state.postMessageUsageListener = function (event) {
+  function installXhrObserver() {
+    if (typeof window.XMLHttpRequest !== "function" || state.xhrIntercepted) return;
+    const Xhr = window.XMLHttpRequest;
+    const originalOpen = Xhr.prototype.open;
+    const originalSend = Xhr.prototype.send;
+    Xhr.prototype.open = function open(method, url, ...rest) {
+      this.__codexContextMeterXhrUrl = url;
+      return originalOpen.call(this, method, url, ...rest);
+    };
+    Xhr.prototype.send = function send(...args) {
+      this.addEventListener?.("loadend", () => {
+        const url = this.__codexContextMeterXhrUrl;
+        if (!isCodexApiUrl(url)) return;
         try {
-          const data = event.data;
-          if (!data) return;
-          let payload = data;
-          if (typeof data === "string") {
-            try { payload = JSON.parse(data); } catch { return; }
+          const usages = extractUsages(this.responseText || "");
+          if (usages.length) rememberCapturedUsage(usages);
+        } catch (_) {
+          // Ignore unreadable XHR bodies.
+        }
+      });
+      return originalSend.apply(this, args);
+    };
+    state.xhrIntercepted = true;
+  }
+
+  function installWebSocketObserver() {
+    if (typeof window.WebSocket !== "function" || state.webSocketIntercepted) return;
+    const NativeWebSocket = window.WebSocket;
+
+    function WrappedWebSocket(...args) {
+      const socket = new NativeWebSocket(...args);
+      socket.addEventListener?.("message", (event) => {
+        try {
+          if (typeof event.data === "string") {
+            const usages = extractUsages(event.data);
+            if (usages.length) rememberCapturedUsage(usages);
+          } else if (event.data instanceof Blob && event.data.size <= 512000) {
+            event.data.text().then((text) => {
+              const usages = extractUsages(text);
+              if (usages.length) rememberCapturedUsage(usages);
+            }).catch(() => {});
           }
-          const found = extractUsagesFromPayload(payload);
-          if (found.length) rememberCapturedUsage(found);
-        } catch {}
-      }),
+        } catch (_) {
+          // Keep socket delivery untouched.
+        }
+      });
+      return socket;
+    }
+
+    try {
+      WrappedWebSocket.prototype = NativeWebSocket.prototype;
+      Object.defineProperty(WrappedWebSocket, "CONNECTING", { value: NativeWebSocket.CONNECTING });
+      Object.defineProperty(WrappedWebSocket, "OPEN", { value: NativeWebSocket.OPEN });
+      Object.defineProperty(WrappedWebSocket, "CLOSING", { value: NativeWebSocket.CLOSING });
+      Object.defineProperty(WrappedWebSocket, "CLOSED", { value: NativeWebSocket.CLOSED });
+    } catch (_) {
+      // Constants are best-effort compatibility helpers.
+    }
+
+    window.WebSocket = WrappedWebSocket;
+    state.webSocketIntercepted = true;
+  }
+
+  function installPostMessageObserver() {
+    if (state.postMessageObserverInstalled) return;
+    state.postMessageObserverInstalled = true;
+    window.addEventListener?.(
+      "message",
+      (event) => {
+        try {
+          const usages = extractUsages(event.data);
+          if (usages.length) rememberCapturedUsage(usages);
+        } catch (_) {
+          // Ignore unrelated window messages.
+        }
+      },
       true,
     );
   }
 
   function installNetworkInterceptors() {
-    installWebSocketInterceptor();
-    installFetchInterceptor();
-    installPostMessageUsageCapture();
+    installFetchObserver();
+    installXhrObserver();
+    installWebSocketObserver();
+    installPostMessageObserver();
   }
 
   // v103: 读取网络拦截捕获的 usage（WebSocket / fetch / postMessage 共享同一缓存）。
@@ -3949,14 +4028,15 @@
     if (Date.now() - state.capturedUsageAt > 10 * 60 * 1000) return null;
 
     const { used, limit, conversationId } = state.capturedUsage;
+    // 仅当捕获的 usage 属于当前会话时才采用；否则切换会话后会沿用旧会话读数，
+    // 导致上下文不重置。归属不明确时（无活跃会话或无归属）退回旧行为。
+    const ownerConversationId = normalizeConversationId(state.capturedUsageConversationId || conversationId);
+    if (activeConversationId && ownerConversationId && !conversationIdsMatch(ownerConversationId, activeConversationId)) {
+      return null;
+    }
     const percent = (used / limit) * 100;
     const reading = makeReading(percent, "network-capture", "websocket/fetch", used, limit);
-    return withConversationId(reading, conversationId || activeConversationId);
-  }
-
-  // 保留旧函数名兼容（postMessage 数据现在统一走 capturedUsage）。
-  function scanPostMessageContextUsage(activeConversationId) {
-    return scanCapturedContextUsage(activeConversationId);
+    return withConversationId(reading, ownerConversationId || conversationId || activeConversationId);
   }
 
   function detectReading() {
@@ -3971,12 +4051,6 @@
       return capturedReading;
     }
 
-    const tokenUsageReading = scanTokenUsageScriptContextUsage(activeConversationId);
-    if (tokenUsageReading) {
-      state.switchRetryUntil = 0;
-      clearRetryUpdate();
-      return tokenUsageReading;
-    }
 
     if (!activeConversationId) {
       const appSignalReading = scanAppSignalContextUsage(null);
@@ -4212,25 +4286,6 @@
     }, SWITCH_RETRY_INTERVAL_MS);
   }
 
-  function restoreLegacyCaptureHooks() {
-    const captureState = window.__codexContextMeterCaptureState;
-    if (!captureState || typeof captureState !== "object") return;
-
-    if (captureState.nativeFetch && window.fetch !== captureState.nativeFetch) {
-      window.fetch = captureState.nativeFetch;
-    }
-    if (captureState.NativeWebSocket && window.WebSocket !== captureState.NativeWebSocket) {
-      window.WebSocket = captureState.NativeWebSocket;
-    }
-    if (captureState.messageListener) {
-      window.removeEventListener("message", captureState.messageListener, true);
-    }
-
-    delete window.__codexContextMeterCaptureState;
-    delete window.__codexContextMeterFetchPatched;
-    delete window.__codexContextMeterWebSocketPatched;
-    delete window.__codexContextMeterPostMessagePatched;
-  }
 
   function installObserver() {
     if (state.observer) return;
@@ -4272,7 +4327,6 @@
     setProviderSummary,
     diagnose() {
       const scope = findAppSignalScope();
-      const tu = window.__codexTokenUsage;
       return {
         scriptVersion: SCRIPT_VERSION,
         hasScope: !!scope,
@@ -4280,13 +4334,13 @@
         scopeValueType: scope?.value ? typeof scope.value : "null",
         scopeValueKeys: scope?.value && typeof scope.value === "object" ? Object.keys(scope.value).slice(0, 20) : [],
         hasModules: !!state.appSignalModules,
-        hasTokenUsageScript: !!tu,
-        tokenUsageLast: tu?.last ? { source: tu.last.source, usageKeys: tu.last.usage ? Object.keys(tu.last.usage).slice(0, 20) : [] } : null,
         capturedUsage: state.capturedUsage,
+        capturedUsageConversationId: state.capturedUsageConversationId,
         lastSeenModel: state.lastSeenModel,
         lastReading: state.lastReading,
         webSocketIntercepted: state.webSocketIntercepted,
         fetchIntercepted: state.fetchIntercepted,
+        xhrIntercepted: state.xhrIntercepted,
       };
     },
     isHealthy() {
@@ -4319,13 +4373,13 @@
         window.removeEventListener(PROVIDER_SUMMARY_EVENT, state.providerSummaryListener);
         state.providerSummaryListener = null;
       }
-      if (state.postMessageUsageListener) {
-        window.removeEventListener("message", state.postMessageUsageListener, true);
-        state.postMessageUsageListener = null;
-      }
+      state.postMessageObserverInstalled = false;
       state.capturedUsage = null;
       state.capturedUsageAt = 0;
       state.lastSeenModel = null;
+      state.webSocketIntercepted = false;
+      state.fetchIntercepted = false;
+      state.xhrIntercepted = false;
 
       const root = document.getElementById(ROOT_ID);
       if (root) root.remove();
@@ -4355,7 +4409,6 @@
     },
   };
 
-  restoreLegacyCaptureHooks();
   installStyle();
   installNetworkInterceptors();
   installProviderSummaryListener();

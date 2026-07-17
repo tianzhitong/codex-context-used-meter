@@ -73,6 +73,17 @@ global.window = {
     timeouts.push({ fn, ms });
     return id;
   },
+  XMLHttpRequest: function () {
+    return {
+      open: () => {},
+      send: () => {},
+      addEventListener: () => {},
+      setRequestHeader: () => {},
+      readyState: 4,
+      status: 200,
+      responseText: "",
+    };
+  },
   WebSocket: function () {
     return { addEventListener: () => {}, readyState: 1, send: () => {}, close: () => {} };
   },
@@ -159,7 +170,7 @@ function assert(name, condition, detail) {
 }
 
 // Test 1: Script loaded with correct version
-assert("v107 version", api.version === 110, `got ${api.version}`);
+assert("script version", api.version === 112, `got ${api.version}`);
 
 // Test 2: diagnose function exists and returns expected shape
 assert("diagnose exists", typeof api.diagnose === "function");
@@ -280,5 +291,139 @@ try {
   assert("glm-5.2n limit is 1048576", false, e.message);
 }
 
+// Test 9: switching conversations must reset the context meter (v111 fix).
+// Captured network usage used to bleed across conversations because the API
+// response carries no conversationId, so the captured reading got re-tagged
+// with whatever conversation was active at scan time.
+const realDateNow = Date.now;
+// Start well past any lookup timestamps cached by earlier tests (which used real time),
+// so the active-conversation / thread-content lookup caches are treated as stale.
+let testClock = realDateNow() + 1000000;
+Date.now = () => testClock;
+
+// Simulate the Codex app conversation window so hasThreadContentSurface() is true.
+const appLocation = { href: "app://-/index.html", pathname: "/index.html", search: "", hash: "" };
+global.location = appLocation;
+window.location = appLocation;
+
+// Rich mock element whose querySelector returns a child for any selector,
+// so ensureRoot/bindRootElements can wire up the render surface.
+function richMock(tag) {
+  const el = makeMockElement(tag);
+  el.nodeType = Node.ELEMENT_NODE;
+  el.isConnected = true;
+  el.querySelector = () => richMock("div");
+  el.querySelectorAll = () => [];
+  return el;
+}
+
+let activeThreadId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+const sidebarEl = richMock("div");
+sidebarEl.getAttribute = (k) => k === "data-app-action-sidebar-thread-id" ? activeThreadId : null;
+sidebarEl.parentElement = null;
+const mainEl = richMock("main");
+
+const origQuerySelector = document.querySelector;
+const origGetElementById = document.getElementById;
+const origCreateElement = document.createElement;
+document.querySelector = function (selector) {
+  if (selector === "main") return mainEl;
+  if (/aria-current|aria-selected|thread-active/.test(selector)) return sidebarEl;
+  return null;
+};
+document.getElementById = function () { return null; };
+document.createElement = function (tag) { return richMock(tag); };
+
+try {
+  // Step 1: activate conversation A.
+  testClock += 1000;
+  api.refresh();
+  assert("active conversation is A", api.getState().activeConversationId === activeThreadId, `got ${api.getState().activeConversationId}`);
+
+  // Step 2: capture usage while A is active.
+  const usageA = { model: "gpt-5", usage: { input_tokens: 50000, total_tokens: 55000 } };
+  messageListeners.forEach((fn) => fn({ data: JSON.stringify(usageA), source: window }));
+  const diagA = api.diagnose();
+  assert("captured usage associated with A", diagA.capturedUsageConversationId === activeThreadId, `got ${diagA.capturedUsageConversationId}`);
+
+  // Step 3: refresh shows A's reading.
+  testClock += 1000;
+  api.refresh();
+  const diagA2 = api.diagnose();
+  assert("lastReading reflects A usage", diagA2.lastReading && diagA2.lastReading.used === 50000, `got ${JSON.stringify(diagA2.lastReading && diagA2.lastReading.used)}`);
+
+  // Step 4: switch to conversation B — meter must reset, not bleed A's reading.
+  activeThreadId = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+  sidebarEl.getAttribute = (k) => k === "data-app-action-sidebar-thread-id" ? activeThreadId : null;
+  testClock += 1000;
+  api.refresh();
+  const diagB = api.diagnose();
+  assert("switched active conversation is B", api.getState().activeConversationId === activeThreadId, `got ${api.getState().activeConversationId}`);
+  assert("lastReading reset after switch (no bleed)", !diagB.lastReading || diagB.lastReading.used !== 50000, `got ${JSON.stringify(diagB.lastReading && diagB.lastReading.used)}`);
+
+  // Step 5: switching back to A still shows A's captured reading.
+  activeThreadId = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+  sidebarEl.getAttribute = (k) => k === "data-app-action-sidebar-thread-id" ? activeThreadId : null;
+  testClock += 1000;
+  api.refresh();
+  const diagA3 = api.diagnose();
+  assert("lastReading shows A usage after switching back", diagA3.lastReading && diagA3.lastReading.used === 50000, `got ${JSON.stringify(diagA3.lastReading && diagA3.lastReading.used)}`);
+} catch (e) {
+  assert("conversation switch test ran without throwing", false, e.stack || e.message);
+} finally {
+  Date.now = realDateNow;
+  document.querySelector = origQuerySelector;
+  document.getElementById = origGetElementById;
+  document.createElement = origCreateElement;
+}
+
 // Re-print summary
 console.log(`\n${passed} passed, ${failed} failed`);
+// Test 10: XHR interception is installed (v112).
+assert("diagnose has xhrIntercepted", typeof api.diagnose().xhrIntercepted === "boolean");
+assert("XHR intercepted", api.diagnose().xhrIntercepted === true);
+
+// Test 11: SSE stream fragment parsing (v112).
+// A streaming response sends usage in `data:` lines; the merged extractor
+// should parse each fragment and capture the usage.
+const ssePayload = [
+  'data: {"type":"response.output_text.delta","delta":"hello"}',
+  '',
+  'data: {"type":"response.completed","response":{"model":"gpt-5","usage":{"input_tokens":80000,"output_tokens":8000,"total_tokens":88000}}}',
+  'data: [DONE]',
+  ''
+].join("\n");
+try {
+  messageListeners.forEach((fn) => fn({ data: ssePayload, source: window }));
+  const diagSse = api.diagnose();
+  assert("SSE: capturedUsage set", diagSse.capturedUsage !== null);
+  if (diagSse.capturedUsage) {
+    assert("SSE: used is 80000 (input_tokens)", diagSse.capturedUsage.used === 80000, `got ${diagSse.capturedUsage.used}`);
+    assert("SSE: limit is 400000 (gpt-5)", diagSse.capturedUsage.limit === 400000, `got ${diagSse.capturedUsage.limit}`);
+    assert("SSE: lastSeenModel is gpt-5", diagSse.lastSeenModel === "gpt-5", `got ${diagSse.lastSeenModel}`);
+  }
+} catch (e) {
+  assert("SSE parsing ran without throwing", false, e.message);
+}
+
+// Test 12: Cached token fields are captured in the normalized usage (v112).
+// Anthropic-style response with cached_tokens.
+const cachedUsage = {
+  model: "gpt-5",
+  usage: {
+    input_tokens: 30000,
+    output_tokens: 3000,
+    total_tokens: 33000,
+    cached_tokens: 20000,
+  },
+};
+try {
+  messageListeners.forEach((fn) => fn({ data: JSON.stringify(cachedUsage), source: window }));
+  const diagCached = api.diagnose();
+  assert("cached: capturedUsage set", diagCached.capturedUsage !== null);
+  if (diagCached.capturedUsage) {
+    assert("cached: used is 30000 (input_tokens, not total)", diagCached.capturedUsage.used === 30000, `got ${diagCached.capturedUsage.used}`);
+  }
+} catch (e) {
+  assert("cached token test ran without throwing", false, e.message);
+}
