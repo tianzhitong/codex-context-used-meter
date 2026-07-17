@@ -9,7 +9,7 @@
   const UI_STATE_STORAGE_KEY = "__codexContextMeterUiState";
   const PROVIDER_SUMMARY_KEY = "__codexContextMeterProviderSummary";
   const PROVIDER_SUMMARY_EVENT = "codex-context-meter-provider-summary";
-  const SCRIPT_VERSION = 103;
+  const SCRIPT_VERSION = 110;
   const UPDATE_INTERVAL_MS = 5000;
   const SLOW_SCAN_INTERVAL_MS = UPDATE_INTERVAL_MS;
   const CONTEXT_USAGE_BACKGROUND_SAMPLE_INTERVAL_MS = UPDATE_INTERVAL_MS;
@@ -152,6 +152,32 @@
   const PREFERRED_STATUS_KEY_SET = new Set(PREFERRED_STATUS_KEYS);
   const STATUS_TREE_KEY_RE = /context|usage|status|thread|conversation|token|query|data|props|memoized|pending|return|child|sibling|state|value|current|store|atom|map|cache/i;
   const APP_SIGNAL_SCOPE_KEY_RE = /memoized|pending|dependencies|firstContext|context|value|current|return|child|sibling|state|store|node|chain|scope|provider|props|query|cache/i;
+
+  // v104: OpenAI API 响应只带 input_tokens / total_tokens，没有 contextLimit。
+  // 用模型名查上下文窗口，让网络拦截也能算出百分比。
+  const MODEL_CONTEXT_WINDOWS = {
+    "o3": 200000,
+    "o3-mini": 200000,
+    "o4-mini": 200000,
+    "gpt-4.1": 1047576,
+    "gpt-4.1-mini": 1047576,
+    "gpt-4.1-nano": 1047576,
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-5": 400000,
+    "gpt-5-mini": 400000,
+    "gpt-5-nano": 400000,
+    "codex-1": 200000,
+    // GLM 系列
+    "glm-5.2n": 1048576,
+    "glm5.2n": 1048576,
+    "glm-5.2": 1048576,
+    "glm5.2": 1048576,
+    "glm-4-plus": 128000,
+    "glm-4": 128000,
+    "glm": 1048576,
+  };
+  const DEFAULT_CONTEXT_WINDOW = 1048576;
   const CONVERSATION_REACT_KEY_RE = /^(?:props|children|memoizedProps|pendingProps|memoizedState|stateNode|child|sibling|return|alternate|value|current|context|node|chain|conversationId|localConversationId|threadId|id|key|params|thread|conversation)$/;
   const REACT_PRIVATE_KEY_RE = /^__react(?:Props|Fiber|Container)\$/;
   const CONVERSATION_ID_KEYS = [
@@ -284,6 +310,8 @@
     capturedUsageAt: 0,
     webSocketIntercepted: false,
     fetchIntercepted: false,
+    // v104: 网络拦截看到的最后一个模型名，用于查上下文窗口。
+    lastSeenModel: null,
     threadContentLookupAt: 0,
     threadContentLookupResult: false,
   };
@@ -2841,6 +2869,31 @@
   function parseStatusContextUsageObject(value, source, conversationId) {
     if (!value || typeof value !== "object") return null;
 
+    // v104: OpenAI API 响应格式 —— usage.input_tokens + model 查上下文窗口。
+    const directUsage = value.usage;
+    if (directUsage && typeof directUsage === "object") {
+      const apiUsed = firstFiniteNumber(
+        directUsage.input_tokens, directUsage.inputTokens,
+        directUsage.total_tokens, directUsage.totalTokens,
+      );
+      if (Number.isFinite(apiUsed) && apiUsed > 0) {
+        const apiLimit = firstFiniteNumber(
+          value.modelContextWindow, value.model_context_window,
+          value.contextWindow, value.context_window,
+        ) || (typeof value.model === "string" ? lookupModelContextWindow(value.model) : null);
+        if (Number.isFinite(apiLimit) && apiLimit > 0) {
+          const safeApiUsed = Math.min(apiUsed, apiLimit);
+          return withConversationId(makeReading(
+            (safeApiUsed / apiLimit) * 100,
+            source,
+            "api-usage",
+            safeApiUsed,
+            apiLimit,
+          ), conversationId);
+        }
+      }
+    }
+
     const modelContextWindow = firstFiniteNumber(value.modelContextWindow, value.model_context_window);
     const lastUsage = value.last || value.lastTokenUsage || value.last_token_usage;
     const totalTokens = firstFiniteNumber(
@@ -2881,6 +2934,23 @@
 
   function looksLikeStatusContextUsageObject(value) {
     if (!value || typeof value !== "object") return false;
+
+    // v104: OpenAI API 响应格式。
+    const directUsage = value.usage;
+    if (directUsage && typeof directUsage === "object") {
+      const apiUsed = firstFiniteNumber(
+        directUsage.input_tokens, directUsage.inputTokens,
+        directUsage.total_tokens, directUsage.totalTokens,
+      );
+      if (Number.isFinite(apiUsed) && apiUsed > 0) {
+        const apiLimit = firstFiniteNumber(
+          value.modelContextWindow, value.model_context_window,
+          value.contextWindow, value.context_window,
+        );
+        if (Number.isFinite(apiLimit) && apiLimit > 0) return true;
+        if (typeof value.model === "string") return true;
+      }
+    }
 
     const modelContextWindow = firstFiniteNumber(value.modelContextWindow, value.model_context_window);
     const lastUsage = value.last || value.lastTokenUsage || value.last_token_usage;
@@ -3209,23 +3279,26 @@
   }
 
   // 优先读取 Status 使用的 app signal；bundle hash 或导出名变化时，先更新这两个资产入口。
+  // v105: 不再依赖固定资产文件名。改为扫描所有已加载 JS 模块，
+  // 找到导出 signal selector 的模块。
   function ensureAppSignalModules() {
     if (state.appSignalModules) return state.appSignalModules;
     if (state.appSignalModulesPromise) return null;
     state.appSignalModulesRequestedAt = Date.now();
 
-    const appServerUrl = findLoadedAssetUrl(
+    // 先尝试旧版资产名（向后兼容）
+    const legacyAppServerUrl = findLoadedAssetUrl(
       "app-server-manager-signals",
       "./assets/app-server-manager-signals-7MlBpIlX.js",
     );
-    const signalUrl = findLoadedAssetUrl(
+    const legacySignalUrl = findLoadedAssetUrl(
       "setting-storage",
       "./assets/setting-storage-kJblH-wH.js",
     );
 
     state.appSignalModulesPromise = Promise.all([
-      import(appServerUrl),
-      import(signalUrl),
+      import(legacyAppServerUrl),
+      import(legacySignalUrl),
     ])
       .then(([appServerSignals, signalStorage]) => {
         state.appSignalModules = { appServerSignals, signalStorage };
@@ -3233,9 +3306,125 @@
         return state.appSignalModules;
       })
       .catch(() => {
+        // v105: 旧资产名导入失败，扫描所有已加载 JS 模块
+        return scanLoadedModulesForSignalExports();
+      })
+      .then((result) => {
+        if (result) {
+          state.appSignalModules = result;
+          scheduleUpdate();
+          return result;
+        }
         state.appSignalModulesPromise = null;
         return null;
       });
+
+    return null;
+  }
+
+  // v105: 扫描所有已加载的 JS 模块，找到导出 signal selector 的模块。
+  // signal selector 是 object 或 function，配合 scope.get() 使用。
+  function scanLoadedModulesForSignalExports() {
+    const resources =
+      typeof performance !== "undefined" && typeof performance.getEntriesByType === "function"
+        ? performance.getEntriesByType("resource")
+        : [];
+
+    // 收集所有 JS 模块 URL，按文件名排序
+    const moduleUrls = [];
+    const seen = new Set();
+    for (const r of resources) {
+      if (!r || typeof r.name !== "string") continue;
+      if (!r.name.endsWith(".js")) continue;
+      if (seen.has(r.name)) continue;
+      seen.add(r.name);
+      moduleUrls.push(r.name);
+    }
+
+    // 尝试导入每个模块，检查是否导出 signal selector
+    // 限制扫描数量以避免性能问题
+    const maxModules = 80;
+    const candidates = moduleUrls.slice(0, maxModules);
+
+    return Promise.all(
+      candidates.map((url) =>
+        import(url)
+          .then((mod) => {
+            // 检查模块是否导出了看起来像 signal selector 的对象
+            if (!mod || typeof mod !== "object") return null;
+            let selectorCount = 0;
+            for (const key of Object.keys(mod)) {
+              const val = mod[key];
+              if (val && (typeof val === "object" || typeof val === "function")) {
+                selectorCount++;
+              }
+            }
+            // signal selector 模块通常导出大量 selector
+            if (selectorCount < 5) return null;
+            return { appServerSignals: mod, signalStorage: null };
+          })
+          .catch(() => null)
+      )
+    ).then((results) => {
+      for (const result of results) {
+        if (result) return result;
+      }
+      return null;
+    });
+  }
+
+  // v105: 在没有导入模块的情况下，尝试从 scope 内部结构找 signal selector。
+  // scope.node / scope.chain 可能包含可遍历的 signal 路径。
+  function findTokenUsageFromScope(scope, conversationId) {
+    if (!scope || !conversationId) return null;
+
+    // 尝试直接读 scope.value
+    if (scope.value) {
+      const direct = parseStatusContextUsageObject(scope.value, "app-signal-scope-value", conversationId);
+      if (direct) return direct;
+    }
+
+    // 尝试遍历 scope.node 找 signal 子节点
+    const seen = new WeakSet();
+    function scanNode(node, depth) {
+      if (!node || typeof node !== "object" || depth > 6) return null;
+      if (seen.has(node)) return null;
+      seen.add(node);
+
+      // 直接检查 node 本身是否是 usage 对象
+      const direct = parseStatusContextUsageObject(node, "app-signal-node", conversationId);
+      if (direct) return direct;
+
+      // 尝试 scope.get(node, conversationId)
+      try {
+        const val = scope.get(node, conversationId);
+        if (val) {
+          const r = parseStatusContextUsageObject(val, "app-signal-node-get", conversationId);
+          if (r) return r;
+        }
+      } catch {}
+
+      // 遍历子属性
+      for (const key of Object.keys(node).slice(0, 40)) {
+        try {
+          const child = node[key];
+          if (child && typeof child === "object") {
+            const r = scanNode(child, depth + 1);
+            if (r) return r;
+          }
+        } catch {}
+      }
+      return null;
+    }
+
+    const nodeResult = scanNode(scope.node, 0);
+    if (nodeResult) return nodeResult;
+
+    // 尝试遍历 scope.chain
+    if (scope.chain) {
+      const chainResult = scanNode(scope.chain, 0);
+      if (chainResult) return chainResult;
+    }
 
     return null;
   }
@@ -3313,6 +3502,24 @@
     const modules = ensureAppSignalModules();
     if (!modules || !modules.appServerSignals) {
       state.waitingForAppSignalModules = !!state.appSignalModulesPromise;
+      // v105: 模块导入失败时，尝试从 scope 内部结构直接找 usage 数据
+      if (!state.appSignalModulesPromise) {
+        const fallbackScope = findAppSignalScope();
+        if (fallbackScope) {
+          const fallbackConvId = normalizeConversationId(activeConversationId) ||
+            normalizeConversationId(fallbackScope.value && fallbackScope.value.conversationId);
+          if (fallbackConvId) {
+            const fallbackReading = findTokenUsageFromScope(fallbackScope, fallbackConvId);
+            if (fallbackReading) {
+              state.appSignalCachedReading = fallbackReading;
+              state.appSignalCachedConversationId = fallbackConvId;
+              state.appSignalCachedAt = now;
+              state.appSignalLastSuccessAt = now;
+              return fallbackReading;
+            }
+          }
+        }
+      }
       return null;
     }
     state.waitingForAppSignalModules = false;
@@ -3483,8 +3690,12 @@
 
     const usage = entry.usage;
     const used = Number.isFinite(usage.contextUsed) ? usage.contextUsed : usage.totalTokens;
-    const limit = Number.isFinite(usage.contextLimit) ? usage.contextLimit : null;
-    if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return null;
+    // v104: API 响应不带 contextLimit 时，用已捕获的模型名查上下文窗口。
+    let limit = Number.isFinite(usage.contextLimit) ? usage.contextLimit : 0;
+    if (!limit || limit <= 0) {
+      limit = lookupModelContextWindow(state.lastSeenModel);
+    }
+    if (!Number.isFinite(used) || used <= 0 || !Number.isFinite(limit) || limit <= 0) return null;
 
     const percent = (used / limit) * 100;
     const conversationId = entry.conversationId || tu.last.conversationId || null;
@@ -3499,13 +3710,70 @@
     return Number.isFinite(n) && n >= 0 ? Math.round(n) : 0;
   }
 
+  // v104: 用模型名查上下文窗口。模型名常带日期后缀，做前缀匹配。
+  function lookupModelContextWindow(model) {
+    if (!model || typeof model !== "string") return DEFAULT_CONTEXT_WINDOW;
+    const lower = model.toLowerCase();
+    if (MODEL_CONTEXT_WINDOWS[lower]) return MODEL_CONTEXT_WINDOWS[lower];
+    for (const [key, value] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
+      if (lower.startsWith(key)) return value;
+    }
+    return DEFAULT_CONTEXT_WINDOW;
+  }
+
+  // v104: 从 OpenAI API 响应对象里提取 usage —— 同时找 model 和 usage，
+  // 用 model 查上下文窗口作为 limit。API 响应里 usage 和 model 在同一个
+  // response 对象上，但 collectUsageFromObject 拆到 usage 叶子时丢了 model。
+  function extractApiUsageFromObject(obj) {
+    if (!obj || typeof obj !== "object") return null;
+    let model = null;
+    let usage = null;
+
+    function scan(value, depth) {
+      if (!value || typeof value !== "object" || depth > 6) return;
+      if (!model && typeof value.model === "string") model = value.model;
+      if (!usage && value.usage && typeof value.usage === "object") {
+        const inputTokens = Number(value.usage.input_tokens ?? value.usage.inputTokens);
+        if (Number.isFinite(inputTokens) && inputTokens > 0) usage = value.usage;
+      }
+      if (model && usage) return;
+      if (Array.isArray(value)) {
+        for (const item of value) { scan(item, depth + 1); if (model && usage) return; }
+        return;
+      }
+      for (const key of Object.keys(value).slice(0, 50)) {
+        try { scan(value[key], depth + 1); if (model && usage) return; } catch {}
+      }
+    }
+
+    scan(obj, 0);
+    if (!usage) return null;
+
+    const used = Number(
+      usage.input_tokens ?? usage.inputTokens ?? usage.total_tokens ?? usage.totalTokens,
+    );
+    if (!Number.isFinite(used) || used <= 0) return null;
+
+    const limit = lookupModelContextWindow(model);
+    if (model) state.lastSeenModel = model;
+    return { used, limit, conversationId: null };
+  }
+
   function normalizeUsageRaw(raw) {
     if (!raw || typeof raw !== "object") return null;
-    const used = normalizeNumber(raw.contextUsed ?? raw.context_used ?? raw.usedTokens ?? raw.used_tokens ?? raw.used);
-    const limit = Number(
+    const used = normalizeNumber(
+      raw.contextUsed ?? raw.context_used ?? raw.usedTokens ?? raw.used_tokens ?? raw.used
+      ?? raw.input_tokens ?? raw.inputTokens ?? raw.total_tokens ?? raw.totalTokens,
+    );
+    let limit = Number(
       raw.contextLimit ?? raw.context_limit ?? raw.modelContextWindow ?? raw.model_context_window ?? raw.contextWindow ?? raw.context_window ?? raw.limit,
     );
-    if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return null;
+    // v104: 如果没有显式 limit，尝试从同对象的 model 字段查上下文窗口。
+    if (!Number.isFinite(limit) || limit <= 0) {
+      const model = raw.model || raw.modelName || raw.model_name;
+      if (model) limit = lookupModelContextWindow(model);
+    }
+    if (!Number.isFinite(used) || used <= 0 || !Number.isFinite(limit) || limit <= 0) return null;
     return { used, limit, conversationId: raw.conversationId || raw.conversation_id || null };
   }
 
@@ -3545,14 +3813,30 @@
     const found = [];
     if (typeof payload === "string") {
       try {
-        collectUsageFromObject(JSON.parse(payload), 0, found, new WeakSet());
+        const parsed = JSON.parse(payload);
+        collectUsageFromObject(parsed, 0, found, new WeakSet());
+        if (!found.length) {
+          const apiUsage = extractApiUsageFromObject(parsed);
+          if (apiUsage) found.push(apiUsage);
+        }
         if (found.length) return found;
       } catch {}
       for (const fragment of extractJsonFragmentsFromSse(payload)) {
-        try { collectUsageFromObject(JSON.parse(fragment), 0, found, new WeakSet()); } catch {}
+        try {
+          const parsed = JSON.parse(fragment);
+          collectUsageFromObject(parsed, 0, found, new WeakSet());
+          if (!found.length) {
+            const apiUsage = extractApiUsageFromObject(parsed);
+            if (apiUsage) found.push(apiUsage);
+          }
+        } catch {}
       }
     } else if (payload && typeof payload === "object") {
       collectUsageFromObject(payload, 0, found, new WeakSet());
+      if (!found.length) {
+        const apiUsage = extractApiUsageFromObject(payload);
+        if (apiUsage) found.push(apiUsage);
+      }
     }
     return found;
   }
@@ -3679,7 +3963,7 @@
     state.scanGeneration += 1;
     const activeConversationId = updateActiveConversationId();
 
-    // v103: 优先使用自包含网络拦截（WebSocket/fetch）捕获的读数。
+    // v108: capturedUsage 放首位，和 v105 一样。app-signal 用 try-catch 防止异常中断。
     const capturedReading = scanCapturedContextUsage(activeConversationId);
     if (capturedReading) {
       state.switchRetryUntil = 0;
@@ -3687,7 +3971,6 @@
       return capturedReading;
     }
 
-    // v102: 如果 token-usage 脚本存在则复用其数据（可选增强源）。
     const tokenUsageReading = scanTokenUsageScriptContextUsage(activeConversationId);
     if (tokenUsageReading) {
       state.switchRetryUntil = 0;
@@ -3805,7 +4088,13 @@
     const value = state.value;
     const fill = state.fill;
     const compressionZone = state.compressionZone;
-    const reading = detectReading();
+    let reading = null;
+    try {
+      reading = detectReading();
+    } catch (e) {
+      // detectReading 内部任何一个扫描路径抛异常都不应该中断整个刷新周期。
+      reading = state.lastReading;
+    }
     const activeConversationId = state.activeConversationId || readActiveConversationId();
 
     if (!contextCard || !value || !fill) return;
@@ -3981,6 +4270,25 @@
     version: SCRIPT_VERSION,
     refresh: updateMeter,
     setProviderSummary,
+    diagnose() {
+      const scope = findAppSignalScope();
+      const tu = window.__codexTokenUsage;
+      return {
+        scriptVersion: SCRIPT_VERSION,
+        hasScope: !!scope,
+        scopeKeys: scope ? Object.keys(scope).slice(0, 20) : [],
+        scopeValueType: scope?.value ? typeof scope.value : "null",
+        scopeValueKeys: scope?.value && typeof scope.value === "object" ? Object.keys(scope.value).slice(0, 20) : [],
+        hasModules: !!state.appSignalModules,
+        hasTokenUsageScript: !!tu,
+        tokenUsageLast: tu?.last ? { source: tu.last.source, usageKeys: tu.last.usage ? Object.keys(tu.last.usage).slice(0, 20) : [] } : null,
+        capturedUsage: state.capturedUsage,
+        lastSeenModel: state.lastSeenModel,
+        lastReading: state.lastReading,
+        webSocketIntercepted: state.webSocketIntercepted,
+        fetchIntercepted: state.fetchIntercepted,
+      };
+    },
     isHealthy() {
       return !!(state.timer && state.observer && state.root && state.root.isConnected);
     },
@@ -4017,6 +4325,7 @@
       }
       state.capturedUsage = null;
       state.capturedUsageAt = 0;
+      state.lastSeenModel = null;
 
       const root = document.getElementById(ROOT_ID);
       if (root) root.remove();
