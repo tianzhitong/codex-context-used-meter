@@ -9,7 +9,7 @@
   const UI_STATE_STORAGE_KEY = "__codexContextMeterUiState";
   const PROVIDER_SUMMARY_KEY = "__codexContextMeterProviderSummary";
   const PROVIDER_SUMMARY_EVENT = "codex-context-meter-provider-summary";
-  const SCRIPT_VERSION = 101;
+  const SCRIPT_VERSION = 102;
   const UPDATE_INTERVAL_MS = 5000;
   const SLOW_SCAN_INTERVAL_MS = UPDATE_INTERVAL_MS;
   const CONTEXT_USAGE_BACKGROUND_SAMPLE_INTERVAL_MS = UPDATE_INTERVAL_MS;
@@ -268,6 +268,12 @@
     scanGeneration: 0,
     filteredReflectKeyCache: new WeakMap(),
     appSignalSkipGeneration: new WeakMap(),
+    // v102: 独立 postMessage 用量捕获（不依赖 token-usage 脚本时的兜底）。
+    postMessageUsage: null,
+    postMessageUsageConversationId: null,
+    postMessageUsageAt: 0,
+    postMessageListenerInstalled: false,
+    postMessageUsageListener: null,
     threadContentLookupAt: 0,
     threadContentLookupResult: false,
   };
@@ -3446,9 +3452,112 @@
   }
 
   // 读取顺序按稳定性排列：app signal > 结构化 React 状态 > window 缓存。
+  // v102: 从同页的 codex-token-usage 脚本读取已捕获的上下文用量。
+  // token-usage 脚本通过 postMessage / WebSocket 拦截拿到了 contextUsed / contextLimit，
+  // 这正是本组件需要的信号；直接复用避免重复拦截。
+  function scanTokenUsageScriptContextUsage(activeConversationId) {
+    const tu = window.__codexTokenUsage;
+    if (!tu || !tu.last || !tu.last.usage) return null;
+
+    const usage = tu.last.usage;
+    const used = Number.isFinite(usage.contextUsed) ? usage.contextUsed : usage.totalTokens;
+    const limit = Number.isFinite(usage.contextLimit) ? usage.contextLimit : null;
+    if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return null;
+
+    const percent = (used / limit) * 100;
+    const conversationId = tu.last.conversationId || null;
+    const reading = makeReading(percent, "token-usage-script", "__codexTokenUsage.last", used, limit);
+    return withConversationId(reading, conversationId || activeConversationId);
+  }
+
+  // v102: 独立 postMessage 监听，在 token-usage 脚本不存在时兜底捕获用量。
+  // Codex App 通过 window.postMessage 向自身推送 usage 事件，里面带 contextUsed / contextLimit。
+  function normalizeUsageRaw(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const used = Number(raw.contextUsed ?? raw.context_used ?? raw.usedTokens ?? raw.used_tokens ?? raw.used);
+    const limit = Number(
+      raw.contextLimit ?? raw.context_limit ?? raw.modelContextWindow ?? raw.model_context_window ?? raw.contextWindow ?? raw.context_window ?? raw.limit,
+    );
+    if (!Number.isFinite(used) || !Number.isFinite(limit) || limit <= 0) return null;
+    return { used, limit, conversationId: raw.conversationId || raw.conversation_id || null };
+  }
+
+  function collectUsageFromObject(value, depth, found) {
+    if (!value || depth > 8 || found.length > 0) return;
+    if (Array.isArray(value)) {
+      for (const item of value) collectUsageFromObject(item, depth + 1, found);
+      return;
+    }
+    if (typeof value !== "object") return;
+
+    const direct = normalizeUsageRaw(value);
+    if (direct) { found.push(direct); return; }
+    for (const key of ["usage", "last", "lastUsage", "lastTokenUsage"]) {
+      const nested = normalizeUsageRaw(value[key]);
+      if (nested) { found.push(nested); return; }
+    }
+    for (const key of Object.keys(value).slice(0, 60)) {
+      try { collectUsageFromObject(value[key], depth + 1, found); } catch {}
+    }
+  }
+
+  function installPostMessageUsageCapture() {
+    if (state.postMessageListenerInstalled) return;
+    state.postMessageListenerInstalled = true;
+
+    window.addEventListener(
+      "message",
+      (state.postMessageUsageListener = function (event) {
+        try {
+          const data = event.data;
+          if (!data) return;
+          let payload = data;
+          if (typeof data === "string") {
+            try { payload = JSON.parse(data); } catch { return; }
+          }
+          const found = [];
+          collectUsageFromObject(payload, 0, found);
+          if (!found.length) return;
+          const latest = found[found.length - 1];
+          state.postMessageUsage = latest;
+          state.postMessageUsageConversationId = latest.conversationId;
+          state.postMessageUsageAt = Date.now();
+          scheduleUpdate(MUTATION_UPDATE_DELAY_MS);
+        } catch {}
+      }),
+      true,
+    );
+  }
+
+  function scanPostMessageContextUsage(activeConversationId) {
+    if (!state.postMessageUsage) return null;
+    // 10 分钟外的捕获视为过期。
+    if (Date.now() - state.postMessageUsageAt > 10 * 60 * 1000) return null;
+
+    const { used, limit, conversationId } = state.postMessageUsage;
+    const percent = (used / limit) * 100;
+    const reading = makeReading(percent, "post-message", "window.message", used, limit);
+    return withConversationId(reading, conversationId || activeConversationId);
+  }
+
   function detectReading() {
     state.scanGeneration += 1;
     const activeConversationId = updateActiveConversationId();
+
+    // v102: 优先从 token-usage 脚本和 postMessage 捕获读数，不依赖已失效的 app-signal chunk。
+    const tokenUsageReading = scanTokenUsageScriptContextUsage(activeConversationId);
+    if (tokenUsageReading) {
+      state.switchRetryUntil = 0;
+      clearRetryUpdate();
+      return tokenUsageReading;
+    }
+
+    const postMessageReading = scanPostMessageContextUsage(activeConversationId);
+    if (postMessageReading) {
+      state.switchRetryUntil = 0;
+      clearRetryUpdate();
+      return postMessageReading;
+    }
 
     if (!activeConversationId) {
       const appSignalReading = scanAppSignalContextUsage(null);
@@ -3763,6 +3872,10 @@
         window.removeEventListener(PROVIDER_SUMMARY_EVENT, state.providerSummaryListener);
         state.providerSummaryListener = null;
       }
+      if (state.postMessageUsageListener) {
+        window.removeEventListener("message", state.postMessageUsageListener, true);
+        state.postMessageUsageListener = null;
+      }
 
       const root = document.getElementById(ROOT_ID);
       if (root) root.remove();
@@ -3794,6 +3907,7 @@
 
   restoreLegacyCaptureHooks();
   installStyle();
+  installPostMessageUsageCapture();
   installProviderSummaryListener();
   updateMeter();
   installObserver();
